@@ -1,16 +1,18 @@
-# Teman Nongkrong 🎮
+# Teman Nongkrong 🎮 — Mori
 
-Bot Discord teman ngobrol santai, pakai Gemini 1.5 Flash + memory per-user (SQLite).
+Bot Discord teman ngobrol santai (persona: **Mori**), pakai Gemini + memory per-user (SQLite)
+dan pencarian web (Google Search grounding) buat info terkini.
 
 ## Struktur
 
 ```
 teman-nongkrong/
-├── main.py          # Logic bot utama
-├── database.py       # SQLite memory per user
+├── main.py                     # Logic bot utama
+├── database.py                  # SQLite memory per user
+├── example_conversations.json   # Contoh percakapan (referensi gaya bicara Mori)
 ├── requirements.txt
-├── Procfile           # Buat Railway
-├── .env.example
+├── Procfile                     # Buat Railway
+├── .env
 └── .gitignore
 ```
 
@@ -35,7 +37,7 @@ teman-nongkrong/
    python main.py
    ```
 
-5. Test dengan mention bot di channel yang sudah ditentukan: `@TemanNongkrong halo!`
+5. Test dengan mention bot di channel yang sudah ditentukan: `@Mori halo!`
 
 ## Deploy ke Railway
 
@@ -57,6 +59,15 @@ teman-nongkrong/
   Volume atau pindah ke Postgres. Untuk sekarang (server kecil, testing) SQLite lokal udah cukup.
 - **Trigger**: bot cuma respon kalau di-mention DAN channel-nya ada di daftar `ALLOWED_CHANNEL_IDS`
   (public + testing).
+- **Search grounding**: bot bisa pakai Google Search lewat Gemini buat jawab hal-hal terkini
+  (bukan cuma dari data pelatihan). Hasil pencarian disampaikan natural tanpa nomor kutipan/link.
+- **Contoh percakapan**: gaya bicara Mori sebagian direferensiin dari `example_conversations.json`
+  (banyak pasang `user` ↔ `mori` per kategori: sapaan, roasting ringan, obrolan receh, dll).
+  Bot otomatis nge-load & nyambungin isinya ke system prompt pas start (`load_example_conversations()`
+  di `main.py`). Kalau file ini nggak ada, bot tetap jalan normal cuma tanpa contoh tambahan —
+  jadi aman buat nge-edit/nambah contoh kapan aja tanpa nyentuh kode.
+- **Pesan panjang**: kalau balasan Gemini lebih dari ~1950 karakter, bot otomatis pecah jadi
+  beberapa pesan Discord berurutan (dipotong di batas paragraf/kalimat, bukan asal potong/di-truncate).
 - Kalau mau reset memory user tertentu, bisa panggil `database.clear_history(user_id)` manual
   atau kita tambahin command khusus nanti (misal `!lupain`).
 
