@@ -38,7 +38,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # Ganti di sini kalau mau pindah model lain dari hasil ListModels kamu,
 # misal "gemini-flash-latest" atau "gemini-2.5-flash-lite"
 # (gemini-2.5-flash sudah ditarik dari akses user baru, per Juli 2026)
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_MODEL = "gemini-flash-latest"
 
 SYSTEM_PROMPT = """Kamu adalah Mori, teman ngobrol Discord.
 

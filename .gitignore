@@ -2,3 +2,5 @@
 bot_memory.db
 __pycache__/
 *.pyc
+listt_model.py
+test_search.py
