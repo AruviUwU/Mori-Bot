@@ -7,11 +7,13 @@ pake Gemini sebagai otak (SDK google.genai terbaru), dan inget percakapan tiap u
 import os
 import json
 import random
+import asyncio
 import discord
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from ddgs import DDGS
+from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
 
 import database
 
@@ -91,24 +93,43 @@ EXAMPLE_SAMPLE_SIZE = int(os.getenv("EXAMPLE_SAMPLE_SIZE", "10"))
 # koheren buat obrolan santai (bukan tugas yang butuh presisi tinggi).
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.9"))
 
-# duckduckgo pengganti google grounding
-def cari_info_terbaru(query: str, max_results: int = 3) -> str:
-    """Cari info dari DuckDuckGo dan kembalikan sebagai string."""
-    try:
+
+async def cari_info_terbaru(query: str, max_results: int = 3) -> str:
+    """
+    Cari info dari DuckDuckGo dan kembalikan sebagai string.
+
+    Dijalankan lewat asyncio.to_thread supaya panggilan network yang blocking
+    dari `ddgs` tidak nge-freeze event loop Discord (penyebab bot lag/putus
+    koneksi pas lagi searching).
+    """
+
+    def _search():
         with DDGS() as ddgs:
-            # Mengambil hasil pencarian teks
-            results = list(ddgs.text(query, max_results=max_results))
-            if not results:
-                return "Tidak ada informasi terbaru dari internet."
-            
-            # Gabungkan judul dan isi singkatnya
-            info = []
-            for r in results:
-                info.append(f"- {r['title']}: {r['body']}")
-            return "\n".join(info)
-    except Exception as e:
+            return list(
+                ddgs.text(query, max_results=max_results, region="id-id", backend="auto")
+            )
+
+    try:
+        results = await asyncio.to_thread(_search)
+    except RatelimitException:
+        print("⚠️ DDGS kena rate limit")
+        return "Tidak ada informasi terbaru dari internet (lagi kena limit pencarian, coba lagi nanti)."
+    except TimeoutException:
+        print("⚠️ DDGS timeout")
+        return "Gagal mengambil data dari internet (timeout)."
+    except DDGSException as e:
         print(f"⚠️ Error pencarian web: {e}")
         return "Gagal mengambil data dari internet."
+    except Exception as e:
+        print(f"⚠️ Error pencarian web (unexpected): {e}")
+        return "Gagal mengambil data dari internet."
+
+    if not results:
+        return "Tidak ada informasi terbaru dari internet."
+
+    info = [f"- {r['title']}: {r['body']}" for r in results]
+    return "\n".join(info)
+
 
 def _load_raw_examples(path: str = EXAMPLES_PATH) -> list[dict]:
     """Baca example_conversations.json, return list mentah (belum diformat)."""
@@ -245,9 +266,9 @@ async def on_message(message: discord.Message):
             butuh_search = any(kw in user_text.lower() for kw in keywords)
 
             if butuh_search:
-                # Bot diam-diam googling dulu
-                hasil_search = cari_info_terbaru(user_text)
-                
+                # Bot diam-diam googling dulu (non-blocking, lewat asyncio.to_thread)
+                hasil_search = await cari_info_terbaru(user_text)
+
                 # Format prompt untuk disuapkan ke Gemini
                 prompt_final = (
                     f"{user_text}\n\n"
@@ -272,7 +293,7 @@ async def on_message(message: discord.Message):
                     ),
                 ),
             )
-            
+
             # Kirim prompt_final (yang mungkin sudah ada contekan dari internet) ke Gemini
             response = await chat.send_message(prompt_final)
             reply_text = response.text.strip()
