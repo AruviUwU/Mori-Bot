@@ -9,6 +9,8 @@ import json
 import random
 import asyncio
 import discord
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -43,6 +45,25 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # (gemini-2.5-flash sudah ditarik dari akses user baru, per Juli 2026)
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 
+# Timezone dipakai buat nentuin "hari ini"/"sekarang" versi bot. Ganti kalau
+# server/majoritas user-nya di zona waktu lain.
+BOT_TIMEZONE = ZoneInfo(os.getenv("BOT_TIMEZONE", "Asia/Jakarta"))
+
+_INDO_HARI = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+_INDO_BULAN = [
+    "", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+    "Juli", "Agustus", "September", "Oktober", "November", "Desember",
+]
+
+
+def get_tanggal_sekarang() -> str:
+    """String tanggal+jam sekarang dalam Bahasa Indonesia, dipake buat kasih tau Gemini 'hari ini' itu tanggal berapa."""
+    now = datetime.now(BOT_TIMEZONE)
+    hari = _INDO_HARI[now.weekday()]
+    bulan = _INDO_BULAN[now.month]
+    return f"{hari}, {now.day} {bulan} {now.year}, pukul {now.strftime('%H:%M')} WIB"
+
+
 SYSTEM_PROMPT = """Kamu adalah Mori, teman ngobrol Discord.
 
 # Kepribadian
@@ -74,12 +95,17 @@ SYSTEM_PROMPT = """Kamu adalah Mori, teman ngobrol Discord.
 - Jangan mengulang kalimat yang sama terus-menerus.
 - Jangan menjawab persis sama dengan contoh kecuali memang sangat diperlukan.
 
+# Tanggal & Waktu
+- Di awal system prompt ini (bagian paling atas, sebelum kepribadian) ada info tanggal & jam SEKARANG yang sebenarnya. WAJIB pakai itu sebagai patokan tunggal buat "hari ini", "sekarang", "besok", "minggu ini", dst -- JANGAN pernah nebak-nebak atau pakai tanggal dari ingatan/pelatihanmu sendiri, karena itu bisa aja sudah basi.
+- Kalau user nanya sesuatu yang sifatnya "hari ini"/"sekarang" (jadwal, pertandingan, acara, dll), SELALU sertakan tanggal spesifik itu ke query pencarian tool `cari_info_terbaru` (misal 'jadwal VCT Pacific 18 Juli 2026', bukan cuma 'jadwal VCT Pacific hari ini' -- tool pencariannya gak ngerti kata 'hari ini', harus tanggal konkret).
+
 # Pencarian Web
-- Kamu punya tool bernama `cari_info_terbaru` buat cari info real-time dari internet (sekarang tahun 2026).
+- Kamu punya tool bernama `cari_info_terbaru` buat cari info real-time dari internet.
 - Panggil tool itu SENDIRI kalau pertanyaan butuh data yang mungkin berubah-ubah atau kejadiannya baru-baru ini — misalnya cuaca hari ini, skor/hasil pertandingan, siapa yang menang/juara sesuatu, berita, harga, jadwal, atau topik apapun yang kamu gak yakin datanya masih akurat.
 - Kalau pertanyaannya cuma obrolan santai / gak butuh data terkini, JANGAN panggil tool-nya, jawab langsung aja.
-- Setelah dapet hasil dari tool, cek dulu apakah itu beneran relevan dan menjawab pertanyaan. Kalau relevan, sampaikan secara natural layaknya orang ngobrol biasa (jangan bilang "menurut hasil pencarian" atau semacamnya).
-- Kalau hasil tool TIDAK relevan, TIDAK menjawab pertanyaan, atau kosong/gagal, JANGAN dipaksain dipakai. Jujur aja bilang kamu udah coba cari tapi gak nemu info yang pas, atau nggak usah nyambung-nyambungin biar keliatan njawab.
+- Buat hal yang time-sensitive (jadwal pertandingan, skor, siapa yang lagi tanding, dst), PRIORITASKAN hasil dari tool dibanding pengetahuan internalmu. Pengetahuan internalmu soal jadwal/stage/matchup itu SANGAT RAWAN sudah usang atau salah stage/tanggal -- jangan dicampur-campur sama hasil pencarian, apalagi kalau ternyata beda. Kalau ada konflik, hasil pencarian yang menang.
+- Setelah dapet hasil dari tool, cek dulu apakah itu beneran relevan, spesifik ke tanggal yang ditanya, dan menjawab pertanyaan. Kalau relevan, sampaikan secara natural layaknya orang ngobrol biasa (jangan bilang "menurut hasil pencarian" atau semacamnya).
+- Kalau hasil tool TIDAK relevan, TIDAK menjawab pertanyaan, gak match sama tanggal yang ditanya, atau kosong/gagal, JANGAN dipaksain dipakai. Jujur aja bilang kamu udah coba cari tapi gak nemu info yang pas, atau nggak usah nyambung-nyambungin biar keliatan njawab.
 - Jangan pernah ngaku-ngaku udah "cek" atau "cari" sesuatu kalau kamu sebenarnya nggak manggil tool `cari_info_terbaru`.
 - Jangan tampilkan angka referensi/kutipan atau link sumber mentah-mentah di balasan."""
 
@@ -116,21 +142,23 @@ async def cari_info_terbaru(query: str, max_results: int = 5) -> str:
     try:
         results = await asyncio.to_thread(_search)
     except RatelimitException:
-        print("⚠️ DDGS kena rate limit")
+        print(f"⚠️ DDGS kena rate limit (query={query!r})")
         return "GAGAL: pencarian lagi kena rate limit, coba lagi nanti."
     except TimeoutException:
-        print("⚠️ DDGS timeout")
+        print(f"⚠️ DDGS timeout (query={query!r})")
         return "GAGAL: pencarian timeout."
     except DDGSException as e:
-        print(f"⚠️ Error pencarian web: {e}")
+        print(f"⚠️ Error pencarian web (query={query!r}): {e}")
         return "GAGAL: pencarian error."
     except Exception as e:
-        print(f"⚠️ Error pencarian web (unexpected): {e}")
+        print(f"⚠️ Error pencarian web tak terduga (query={query!r}): {e}")
         return "GAGAL: pencarian error."
 
     if not results:
+        print(f"ℹ️ DDGS gak nemu hasil (query={query!r})")
         return "GAGAL: tidak ada hasil pencarian yang ketemu untuk query ini."
 
+    print(f"🔎 DDGS ketemu {len(results)} hasil (query={query!r})")
     info = [f"- {r['title']}: {r['body']}" for r in results]
     return "\n".join(info)
 
@@ -159,8 +187,11 @@ SEARCH_TOOL = types.Tool(
                         type=types.Type.STRING,
                         description=(
                             "Query pencarian yang jelas, spesifik, dan sudah dibersihkan "
-                            "dari basa-basi (bukan copy-paste mentah kalimat user), "
-                            "misalnya 'cuaca Karawang hari ini' atau 'finalis Piala Dunia 2026'."
+                            "dari basa-basi (bukan copy-paste mentah kalimat user). Kalau "
+                            "user nyebut 'hari ini'/'sekarang', GANTI dengan tanggal konkret "
+                            "(pakai info tanggal sekarang dari system prompt), misalnya "
+                            "'cuaca Karawang 18 Juli 2026' atau 'jadwal VCT Pacific 18 Juli 2026' "
+                            "-- jangan kirim kata 'hari ini' apa adanya ke query."
                         ),
                     ),
                 },
@@ -197,11 +228,14 @@ _ALL_EXAMPLES = _load_raw_examples()
 
 def build_system_prompt(sample_size: int = EXAMPLE_SAMPLE_SIZE) -> str:
     """
-    Ambil sample acak dari contoh percakapan dan sambungin ke SYSTEM_PROMPT.
-    Dipanggil tiap request (bukan sekali pas startup) biar sample-nya beda-beda.
+    Tempelin info tanggal/jam sekarang + ambil sample acak dari contoh percakapan,
+    sambungin ke SYSTEM_PROMPT. Dipanggil tiap request (bukan sekali pas startup)
+    biar tanggal & sample-nya selalu up to date/beda-beda.
     """
+    tanggal_block = f"# Info Tanggal & Waktu Sekarang\nSekarang: {get_tanggal_sekarang()}.\n\n"
+
     if not _ALL_EXAMPLES:
-        return SYSTEM_PROMPT
+        return tanggal_block + SYSTEM_PROMPT
 
     sample = random.sample(_ALL_EXAMPLES, min(sample_size, len(_ALL_EXAMPLES)))
     lines = [f"User: {ex['user'].strip()}\nMori: {ex['mori'].strip()}" for ex in sample]
@@ -209,7 +243,7 @@ def build_system_prompt(sample_size: int = EXAMPLE_SAMPLE_SIZE) -> str:
         "# Contoh Percakapan (referensi gaya bicara — JANGAN disalin mentah)\n\n"
         + "\n\n".join(lines)
     )
-    return SYSTEM_PROMPT + "\n\n" + example_block
+    return tanggal_block + SYSTEM_PROMPT + "\n\n" + example_block
 
 # ----- Setup Discord client -----
 intents = discord.Intents.default()
@@ -347,6 +381,7 @@ async def on_message(message: discord.Message):
                     response = await chat.send_message(function_response_part)
                 else:
                     # Tool yang gak dikenal, berhenti aja biar gak nyangkut
+                    print(f"⚠️ Gemini minta tool tak dikenal: {function_call.name!r}")
                     break
 
             reply_text = response.text.strip()
