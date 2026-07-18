@@ -5,7 +5,6 @@ pake Gemini sebagai otak (SDK google.genai terbaru), dan inget percakapan tiap u
 """
 
 import os
-import re
 import json
 import random
 import asyncio
@@ -76,10 +75,12 @@ SYSTEM_PROMPT = """Kamu adalah Mori, teman ngobrol Discord.
 - Jangan menjawab persis sama dengan contoh kecuali memang sangat diperlukan.
 
 # Pencarian Web
-- Kamu punya akses ke pencarian web buat info terkini (sekarang tahun 2026).
-- Kalau ada konteks hasil pencarian yang DIBERIKAN dan itu memang relevan/menjawab pertanyaan, sampaikan secara natural layaknya orang ngobrol biasa.
-- Kalau konteks hasil pencarian yang diberikan TIDAK relevan, TIDAK menjawab pertanyaan, atau kosong/gagal, JANGAN dipaksain dipakai. Abaikan aja konteksnya, dan jawab pake pengetahuanmu sendiri atau jujur bilang kamu kurang tau/gak nemu info yang pas.
-- Jangan mengarang atau menyambung-nyambungkan info yang gak nyambung cuma biar keliatan njawab.
+- Kamu punya tool bernama `cari_info_terbaru` buat cari info real-time dari internet (sekarang tahun 2026).
+- Panggil tool itu SENDIRI kalau pertanyaan butuh data yang mungkin berubah-ubah atau kejadiannya baru-baru ini — misalnya cuaca hari ini, skor/hasil pertandingan, siapa yang menang/juara sesuatu, berita, harga, jadwal, atau topik apapun yang kamu gak yakin datanya masih akurat.
+- Kalau pertanyaannya cuma obrolan santai / gak butuh data terkini, JANGAN panggil tool-nya, jawab langsung aja.
+- Setelah dapet hasil dari tool, cek dulu apakah itu beneran relevan dan menjawab pertanyaan. Kalau relevan, sampaikan secara natural layaknya orang ngobrol biasa (jangan bilang "menurut hasil pencarian" atau semacamnya).
+- Kalau hasil tool TIDAK relevan, TIDAK menjawab pertanyaan, atau kosong/gagal, JANGAN dipaksain dipakai. Jujur aja bilang kamu udah coba cari tapi gak nemu info yang pas, atau nggak usah nyambung-nyambungin biar keliatan njawab.
+- Jangan pernah ngaku-ngaku udah "cek" atau "cari" sesuatu kalau kamu sebenarnya nggak manggil tool `cari_info_terbaru`.
 - Jangan tampilkan angka referensi/kutipan atau link sumber mentah-mentah di balasan."""
 
 
@@ -97,7 +98,7 @@ EXAMPLE_SAMPLE_SIZE = int(os.getenv("EXAMPLE_SAMPLE_SIZE", "10"))
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.9"))
 
 
-async def cari_info_terbaru(query: str, max_results: int = 3) -> str:
+async def cari_info_terbaru(query: str, max_results: int = 5) -> str:
     """
     Cari info dari DuckDuckGo dan kembalikan sebagai string.
 
@@ -116,22 +117,58 @@ async def cari_info_terbaru(query: str, max_results: int = 3) -> str:
         results = await asyncio.to_thread(_search)
     except RatelimitException:
         print("⚠️ DDGS kena rate limit")
-        return "Tidak ada informasi terbaru dari internet (lagi kena limit pencarian, coba lagi nanti)."
+        return "GAGAL: pencarian lagi kena rate limit, coba lagi nanti."
     except TimeoutException:
         print("⚠️ DDGS timeout")
-        return "Gagal mengambil data dari internet (timeout)."
+        return "GAGAL: pencarian timeout."
     except DDGSException as e:
         print(f"⚠️ Error pencarian web: {e}")
-        return "Gagal mengambil data dari internet."
+        return "GAGAL: pencarian error."
     except Exception as e:
         print(f"⚠️ Error pencarian web (unexpected): {e}")
-        return "Gagal mengambil data dari internet."
+        return "GAGAL: pencarian error."
 
     if not results:
-        return "Tidak ada informasi terbaru dari internet."
+        return "GAGAL: tidak ada hasil pencarian yang ketemu untuk query ini."
 
     info = [f"- {r['title']}: {r['body']}" for r in results]
     return "\n".join(info)
+
+
+# Tool/function declaration yang dikasih ke Gemini. Gemini sendiri yang mutusin
+# kapan perlu manggil ini berdasarkan isi pertanyaan user (tidak ada lagi
+# keyword/regex matching manual di sisi bot -- itu gampang meleset: kadang
+# ke-trigger di obrolan biasa, kadang malah nggak ke-trigger pas emang perlu).
+SEARCH_TOOL = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="cari_info_terbaru",
+            description=(
+                "Cari informasi terkini/real-time dari internet lewat web search. "
+                "Pakai ini kalau pertanyaan butuh data yang mungkin berubah-ubah atau "
+                "baru terjadi, misalnya: cuaca hari ini, skor/hasil pertandingan, siapa "
+                "yang menang/juara sesuatu, berita, harga barang, jadwal acara, atau "
+                "topik apapun yang kejadiannya baru-baru ini sehingga pengetahuanmu "
+                "sendiri mungkin sudah usang. Jangan dipakai untuk obrolan santai biasa "
+                "atau pertanyaan yang tidak butuh data terkini."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description=(
+                            "Query pencarian yang jelas, spesifik, dan sudah dibersihkan "
+                            "dari basa-basi (bukan copy-paste mentah kalimat user), "
+                            "misalnya 'cuaca Karawang hari ini' atau 'finalis Piala Dunia 2026'."
+                        ),
+                    ),
+                },
+                required=["query"],
+            ),
+        )
+    ]
+)
 
 
 def _load_raw_examples(path: str = EXAMPLES_PATH) -> list[dict]:
@@ -229,6 +266,19 @@ def chunk_message(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[str]:
     return chunks
 
 
+def _extract_function_call(response):
+    """Ambil function_call pertama dari response Gemini, kalau ada. None kalau nggak ada."""
+    try:
+        parts = response.candidates[0].content.parts or []
+    except (AttributeError, IndexError, TypeError):
+        return None
+    for part in parts:
+        fc = getattr(part, "function_call", None)
+        if fc is not None:
+            return fc
+    return None
+
+
 @client.event
 async def on_ready():
     database.init_db()
@@ -263,42 +313,6 @@ async def on_message(message: discord.Message):
             history = database.get_history(user_id, limit=30)
             gemini_history = build_gemini_history(history)
 
-            # --- MULAI LOGIKA DUCKDUCKGO ---
-            # 1. Deteksi apakah pertanyaan butuh data terkini.
-            #    Dipersempit ke kata-kata yang emang nunjuk ke info real-time/terkini
-            #    (bukan kata generik kayak "info"/"gimana"/"siapa" yang gampang nyangkut
-            #    di obrolan casual biasa), dan pake word-boundary biar gak ke-substring
-            #    match ke kata lain (mis. "informasi" ikut ke-trigger "info").
-            search_keywords = [
-                "terbaru", "berita", "kabar terkini", "hari ini", "baru-baru ini",
-                "tahun ini", "minggu ini", "bulan ini",
-                "2024", "2025", "2026", "2027",
-                "sekarang lagi", "lagi trending", "lagi viral",
-                "harga", "jadwal", "skor", "hasil pertandingan",
-            ]
-            pattern = r"\b(" + "|".join(re.escape(kw) for kw in search_keywords) + r")\b"
-            butuh_search = re.search(pattern, user_text.lower()) is not None
-
-            if butuh_search:
-                # Bot diam-diam googling dulu (non-blocking, lewat asyncio.to_thread)
-                hasil_search = await cari_info_terbaru(user_text)
-
-                # Format prompt untuk disuapkan ke Gemini
-                prompt_final = (
-                    f"{user_text}\n\n"
-                    f"==== KONTEKS INFO TERKINI DARI INTERNET ====\n"
-                    f"{hasil_search}\n"
-                    f"============================================\n"
-                    f"[Instruksi Internal]: Jawablah pesan di atas menggunakan gaya bahasamu yang biasa (Mori). "
-                    f"Cek dulu apakah konteks internet di atas benar-benar relevan dan menjawab pertanyaan. "
-                    f"Kalau relevan, pakai infonya secara natural tanpa terlihat sedang membaca referensi. "
-                    f"Kalau TIDAK relevan/gak nyambung/gak menjawab, ABAIKAN konteks itu sepenuhnya dan jawab "
-                    f"pakai pengetahuanmu sendiri atau jujur bilang kurang tau — jangan dipaksain nyambung-nyambungin."
-                )
-            else:
-                prompt_final = user_text
-            # --- AKHIR LOGIKA DUCKDUCKGO ---
-
             chat = gemini_client.aio.chats.create(
                 model=GEMINI_MODEL,
                 history=gemini_history,
@@ -308,15 +322,37 @@ async def on_message(message: discord.Message):
                     thinking_config=types.ThinkingConfig(
                         thinking_level="low",
                     ),
+                    tools=[SEARCH_TOOL],
                 ),
             )
 
-            # Kirim prompt_final (yang mungkin sudah ada contekan dari internet) ke Gemini
-            response = await chat.send_message(prompt_final)
+            response = await chat.send_message(user_text)
+
+            # Loop function-calling manual: Gemini yang mutusin sendiri kapan
+            # perlu manggil cari_info_terbaru. Dibatasi biar gak infinite loop
+            # kalau modelnya ngotot manggil tool terus.
+            for _ in range(3):
+                function_call = _extract_function_call(response)
+                if function_call is None:
+                    break
+
+                if function_call.name == "cari_info_terbaru":
+                    query = function_call.args.get("query") or user_text
+                    print(f"🔎 Gemini minta search: {query!r}")
+                    hasil_search = await cari_info_terbaru(query)
+                    function_response_part = types.Part.from_function_response(
+                        name="cari_info_terbaru",
+                        response={"result": hasil_search},
+                    )
+                    response = await chat.send_message(function_response_part)
+                else:
+                    # Tool yang gak dikenal, berhenti aja biar gak nyangkut
+                    break
+
             reply_text = response.text.strip()
 
-            # PENTING: Simpan user_text ASLI ke memory, BUKAN prompt_final
-            # Biar database nggak kotor sama teks instruksi scraping
+            # PENTING: Simpan user_text ASLI ke memory, BUKAN hasil tool call
+            # Biar database nggak kotor sama teks hasil scraping/function response
             database.save_message(user_id, "user", user_text)
             database.save_message(user_id, "assistant", reply_text)
 
