@@ -5,6 +5,7 @@ pake Gemini sebagai otak (SDK google.genai terbaru), dan inget percakapan tiap u
 """
 
 import os
+import re
 import json
 import random
 import asyncio
@@ -76,7 +77,9 @@ SYSTEM_PROMPT = """Kamu adalah Mori, teman ngobrol Discord.
 
 # Pencarian Web
 - Kamu punya akses ke pencarian web buat info terkini (sekarang tahun 2026).
-- Kalau pakai info dari hasil pencarian, sampaikan secara natural layaknya orang ngobrol biasa.
+- Kalau ada konteks hasil pencarian yang DIBERIKAN dan itu memang relevan/menjawab pertanyaan, sampaikan secara natural layaknya orang ngobrol biasa.
+- Kalau konteks hasil pencarian yang diberikan TIDAK relevan, TIDAK menjawab pertanyaan, atau kosong/gagal, JANGAN dipaksain dipakai. Abaikan aja konteksnya, dan jawab pake pengetahuanmu sendiri atau jujur bilang kamu kurang tau/gak nemu info yang pas.
+- Jangan mengarang atau menyambung-nyambungkan info yang gak nyambung cuma biar keliatan njawab.
 - Jangan tampilkan angka referensi/kutipan atau link sumber mentah-mentah di balasan."""
 
 
@@ -261,9 +264,20 @@ async def on_message(message: discord.Message):
             gemini_history = build_gemini_history(history)
 
             # --- MULAI LOGIKA DUCKDUCKGO ---
-            # 1. Deteksi apakah pertanyaan butuh data terkini
-            keywords = ["terbaru", "info", "berita", "sekarang", "2024", "2025", "2026", "hari ini", "siapa", "gimana"]
-            butuh_search = any(kw in user_text.lower() for kw in keywords)
+            # 1. Deteksi apakah pertanyaan butuh data terkini.
+            #    Dipersempit ke kata-kata yang emang nunjuk ke info real-time/terkini
+            #    (bukan kata generik kayak "info"/"gimana"/"siapa" yang gampang nyangkut
+            #    di obrolan casual biasa), dan pake word-boundary biar gak ke-substring
+            #    match ke kata lain (mis. "informasi" ikut ke-trigger "info").
+            search_keywords = [
+                "terbaru", "berita", "kabar terkini", "hari ini", "baru-baru ini",
+                "tahun ini", "minggu ini", "bulan ini",
+                "2024", "2025", "2026", "2027",
+                "sekarang lagi", "lagi trending", "lagi viral",
+                "harga", "jadwal", "skor", "hasil pertandingan",
+            ]
+            pattern = r"\b(" + "|".join(re.escape(kw) for kw in search_keywords) + r")\b"
+            butuh_search = re.search(pattern, user_text.lower()) is not None
 
             if butuh_search:
                 # Bot diam-diam googling dulu (non-blocking, lewat asyncio.to_thread)
@@ -276,7 +290,10 @@ async def on_message(message: discord.Message):
                     f"{hasil_search}\n"
                     f"============================================\n"
                     f"[Instruksi Internal]: Jawablah pesan di atas menggunakan gaya bahasamu yang biasa (Mori). "
-                    f"Jika konteks internet di atas relevan, gunakan informasinya secara natural tanpa terlihat sedang membaca referensi."
+                    f"Cek dulu apakah konteks internet di atas benar-benar relevan dan menjawab pertanyaan. "
+                    f"Kalau relevan, pakai infonya secara natural tanpa terlihat sedang membaca referensi. "
+                    f"Kalau TIDAK relevan/gak nyambung/gak menjawab, ABAIKAN konteks itu sepenuhnya dan jawab "
+                    f"pakai pengetahuanmu sendiri atau jujur bilang kurang tau — jangan dipaksain nyambung-nyambungin."
                 )
             else:
                 prompt_final = user_text
