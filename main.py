@@ -5,6 +5,7 @@ pake Gemini sebagai otak (SDK google.genai terbaru), dan inget percakapan tiap u
 """
 
 import os
+import io
 import json
 import random
 import asyncio
@@ -123,6 +124,19 @@ EXAMPLE_SAMPLE_SIZE = int(os.getenv("EXAMPLE_SAMPLE_SIZE", "10"))
 # koheren buat obrolan santai (bukan tugas yang butuh presisi tinggi).
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.9"))
 
+# ----- Konfigurasi attachment (gambar & dokumen) -----
+ALLOWED_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"}
+ALLOWED_DOC_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "text/plain",
+}
+ALLOWED_ATTACHMENT_MIME_TYPES = ALLOWED_IMAGE_MIME_TYPES | ALLOWED_DOC_MIME_TYPES
+
+# Kesepakatan: 10MB per file. Batas ini lebih ketat dari limit Gemini File API
+# sendiri, tapi cukup buat kebanyakan gambar/dokumen chat biasa.
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024
+
 
 async def cari_info_terbaru(query: str, max_results: int = 5) -> str:
     """
@@ -161,6 +175,68 @@ async def cari_info_terbaru(query: str, max_results: int = 5) -> str:
     print(f"🔎 DDGS ketemu {len(results)} hasil (query={query!r})")
     info = [f"- {r['title']}: {r['body']}" for r in results]
     return "\n".join(info)
+
+
+async def process_attachment(att: discord.Attachment):
+    """
+    Validasi + upload satu attachment Discord ke Gemini File API.
+
+    Return tuple (part, info, error):
+    - part  : types.Part siap dipakai di message ke Gemini (None kalau gagal)
+    - info  : dict {url, mime_type, filename} buat disimpan ke database (None kalau gagal)
+    - error : string alasan gagal buat ditampilin ke user (None kalau sukses)
+    """
+    mime_type = att.content_type.split(";")[0].strip().lower() if att.content_type else None
+
+    if mime_type not in ALLOWED_ATTACHMENT_MIME_TYPES:
+        return None, None, f"`{att.filename}` (format `{mime_type or 'tidak diketahui'}` belum didukung)"
+
+    if att.size > MAX_ATTACHMENT_SIZE:
+        size_mb = att.size / (1024 * 1024)
+        return None, None, f"`{att.filename}` ({size_mb:.1f}MB, limit 10MB)"
+
+    try:
+        file_bytes = await att.read()
+        uploaded = await gemini_client.aio.files.upload(
+            file=io.BytesIO(file_bytes),
+            config=types.UploadFileConfig(mime_type=mime_type, display_name=att.filename),
+        )
+
+        # File API kadang butuh waktu proses dulu (terutama PDF/dokumen)
+        # sebelum state-nya ACTIVE dan siap dipakai -> polling singkat.
+        for _ in range(10):
+            if uploaded.state == types.FileState.ACTIVE:
+                break
+            if uploaded.state == types.FileState.FAILED:
+                return None, None, f"`{att.filename}` (gagal diproses Gemini)"
+            await asyncio.sleep(1)
+            uploaded = await gemini_client.aio.files.get(name=uploaded.name)
+        else:
+            return None, None, f"`{att.filename}` (timeout pas nunggu Gemini proses file)"
+
+        part = types.Part.from_uri(file_uri=uploaded.uri, mime_type=mime_type)
+        info = {"url": att.url, "mime_type": mime_type, "filename": att.filename}
+        return part, info, None
+
+    except Exception as e:
+        print(f"⚠️ Gagal upload attachment {att.filename!r}: {e}")
+        return None, None, f"`{att.filename}` (error pas upload ke Gemini)"
+
+
+async def process_attachments(attachments: list[discord.Attachment]):
+    """
+    Proses semua attachment sekaligus lewat process_attachment().
+    Return (parts, infos, errors) — masing-masing list, sesuai attachment yang sukses/gagal.
+    """
+    parts, infos, errors = [], [], []
+    for att in attachments:
+        part, info, error = await process_attachment(att)
+        if part is not None:
+            parts.append(part)
+            infos.append(info)
+        if error is not None:
+            errors.append(error)
+    return parts, infos, errors
 
 
 # Tool/function declaration yang dikasih ke Gemini. Gemini sendiri yang mutusin
@@ -253,12 +329,27 @@ client = discord.Client(intents=intents)
 
 
 def build_gemini_history(history: list[dict]) -> list[types.Content]:
-    """Convert history dari SQLite (role: user/assistant) ke format Content SDK baru."""
+    """
+    Convert history dari SQLite (role: user/assistant) ke format Content SDK baru.
+
+    PENTING: buat pesan lama yang ada attachment-nya, kita NGGAK upload ulang
+    file-nya ke Gemini tiap kali build history (bakal mahal & lambat kalau
+    history-nya panjang). Cukup kasih catatan teks nama file-nya biar Gemini
+    tetap tau konteksnya, tanpa perlu re-process isi filenya lagi.
+    File asli tetap bisa diakses lewat attachment_url yang disimpan di DB.
+    """
     gemini_history = []
     for msg in history:
         role = "model" if msg["role"] == "assistant" else "user"
+        text = msg["content"]
+
+        if msg.get("attachments"):
+            nama_file = ", ".join(a["filename"] for a in msg["attachments"])
+            catatan = f"[user melampirkan file: {nama_file}]"
+            text = f"{text}\n{catatan}" if text else catatan
+
         gemini_history.append(
-            types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
+            types.Content(role=role, parts=[types.Part.from_text(text=text)])
         )
     return gemini_history
 
@@ -337,13 +428,31 @@ async def on_message(message: discord.Message):
     user_text = message.content.replace(f"<@{client.user.id}>", "").strip()
     user_text = user_text.replace(f"<@!{client.user.id}>", "").strip()
 
-    if not user_text:
-        user_text = "Halo!"
-
     user_id = str(message.author.id)
 
     async with message.channel.typing():
         try:
+            # ----- Proses attachment (gambar/PDF/dokumen) kalau ada -----
+            attachment_parts, attachment_infos, attachment_errors = [], [], []
+            if message.attachments:
+                attachment_parts, attachment_infos, attachment_errors = await process_attachments(
+                    message.attachments
+                )
+
+            # Kasih tau user kalau ada file yang gagal diproses (size/format)
+            if attachment_errors:
+                daftar_gagal = "\n".join(f"- {err}" for err in attachment_errors)
+                await message.reply(
+                    f"⚠️ Ada file yang gak bisa gue proses:\n{daftar_gagal}",
+                    mention_author=False,
+                )
+
+            # Tentuin teks final yang dikirim & disimpan
+            if not user_text and not attachment_parts:
+                user_text = "Halo!"
+            elif not user_text:
+                user_text = "(kirim file tanpa teks)"
+
             history = database.get_history(user_id, limit=30)
             gemini_history = build_gemini_history(history)
 
@@ -360,7 +469,9 @@ async def on_message(message: discord.Message):
                 ),
             )
 
-            response = await chat.send_message(user_text)
+            # Gabungin teks + file (kalau ada) jadi satu message multi-part
+            message_parts = [types.Part.from_text(text=user_text)] + attachment_parts
+            response = await chat.send_message(message_parts)
 
             # Loop function-calling manual: Gemini yang mutusin sendiri kapan
             # perlu manggil cari_info_terbaru. Dibatasi biar gak infinite loop
@@ -387,8 +498,9 @@ async def on_message(message: discord.Message):
             reply_text = response.text.strip()
 
             # PENTING: Simpan user_text ASLI ke memory, BUKAN hasil tool call
-            # Biar database nggak kotor sama teks hasil scraping/function response
-            database.save_message(user_id, "user", user_text)
+            # Biar database nggak kotor sama teks hasil scraping/function response.
+            # attachment_infos disimpan biar URL Discord-nya bisa diakses ulang nanti.
+            database.save_message(user_id, "user", user_text, attachments=attachment_infos or None)
             database.save_message(user_id, "assistant", reply_text)
 
             # Discord limit 2000 karakter per pesan — pecah jadi beberapa pesan
