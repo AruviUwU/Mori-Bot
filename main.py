@@ -92,29 +92,23 @@ EXAMPLE_SAMPLE_SIZE = int(os.getenv("EXAMPLE_SAMPLE_SIZE", "10"))
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.9"))
 
 # duckduckgo pengganti google grounding
-def cari_info_terbaru(query: str) -> str:
-    """
-    ALAT PENCARI WEB.
-    Gunakan alat ini SECARA OTOMATIS jika pengguna menanyakan tentang:
-    - Berita terkini, tren, atau kejadian saat ini.
-    - Informasi cuaca, harga, atau data real-time.
-    - Fakta spesifik yang terjadi setelah tahun 2024.
-    
-    Args:
-        query: Kata kunci pencarian singkat dan padat (contoh: "Cuaca Karawang hari ini", "Harga emas terbaru").
-    """
+def cari_info_terbaru(query: str, max_results: int = 3) -> str:
+    """Cari info dari DuckDuckGo dan kembalikan sebagai string."""
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
+            # Mengambil hasil pencarian teks
+            results = list(ddgs.text(query, max_results=max_results))
             if not results:
-                return "Hasil pencarian kosong."
+                return "Tidak ada informasi terbaru dari internet."
             
-            info = [f"- {r['title']}: {r['body']}" for r in results]
-            print(f"🔍 [TOOL USE] Gemini mencari: {query}") # Biar ketahuan di log server
+            # Gabungkan judul dan isi singkatnya
+            info = []
+            for r in results:
+                info.append(f"- {r['title']}: {r['body']}")
             return "\n".join(info)
     except Exception as e:
-        print(f"⚠️ [TOOL USE ERROR]: {e}")
-        return "Gagal mencari di internet."
+        print(f"⚠️ Error pencarian web: {e}")
+        return "Gagal mengambil data dari internet."
 
 def _load_raw_examples(path: str = EXAMPLES_PATH) -> list[dict]:
     """Baca example_conversations.json, return list mentah (belum diformat)."""
@@ -245,6 +239,28 @@ async def on_message(message: discord.Message):
             history = database.get_history(user_id, limit=30)
             gemini_history = build_gemini_history(history)
 
+            # --- MULAI LOGIKA DUCKDUCKGO ---
+            # 1. Deteksi apakah pertanyaan butuh data terkini
+            keywords = ["terbaru", "info", "berita", "sekarang", "2024", "2025", "2026", "hari ini", "siapa", "gimana"]
+            butuh_search = any(kw in user_text.lower() for kw in keywords)
+
+            if butuh_search:
+                # Bot diam-diam googling dulu
+                hasil_search = cari_info_terbaru(user_text)
+                
+                # Format prompt untuk disuapkan ke Gemini
+                prompt_final = (
+                    f"{user_text}\n\n"
+                    f"==== KONTEKS INFO TERKINI DARI INTERNET ====\n"
+                    f"{hasil_search}\n"
+                    f"============================================\n"
+                    f"[Instruksi Internal]: Jawablah pesan di atas menggunakan gaya bahasamu yang biasa (Mori). "
+                    f"Jika konteks internet di atas relevan, gunakan informasinya secara natural tanpa terlihat sedang membaca referensi."
+                )
+            else:
+                prompt_final = user_text
+            # --- AKHIR LOGIKA DUCKDUCKGO ---
+
             chat = gemini_client.aio.chats.create(
                 model=GEMINI_MODEL,
                 history=gemini_history,
@@ -254,20 +270,15 @@ async def on_message(message: discord.Message):
                     thinking_config=types.ThinkingConfig(
                         thinking_level="low",
                     ),
-                    # --- UPGRADE FUNCTION CALLING ---
-                    # Cukup masukkan nama fungsi Python-nya ke sini
-                    tools=[cari_info_terbaru], 
                 ),
             )
             
-            # Kita lempar teks asli dari user. 
-            # Kalau Gemini merasa butuh info baru, dia akan otomatis PAUSE, 
-            # menjalankan fungsi cari_info_terbaru di background,
-            # mengambil hasilnya, lalu melanjutkan menjawab pesan.
-            response = await chat.send_message(user_text)
+            # Kirim prompt_final (yang mungkin sudah ada contekan dari internet) ke Gemini
+            response = await chat.send_message(prompt_final)
             reply_text = response.text.strip()
 
-            # Simpan ke memori
+            # PENTING: Simpan user_text ASLI ke memory, BUKAN prompt_final
+            # Biar database nggak kotor sama teks instruksi scraping
             database.save_message(user_id, "user", user_text)
             database.save_message(user_id, "assistant", reply_text)
 
