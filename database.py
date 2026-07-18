@@ -5,7 +5,8 @@ Unlimited history disimpan per user_id, di-load pas bot mau reply.
 """
 
 import sqlite3
-from datetime import datetime
+# --- PERUBAHAN DI SINI: Tambahkan timezone ---
+from datetime import datetime, timezone
 from contextlib import contextmanager
 
 DB_PATH = "bot_memory.db"
@@ -43,7 +44,8 @@ def save_message(user_id: str, role: str, content: str):
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO conversations (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (str(user_id), role, content, datetime.utcnow().isoformat())
+            # --- PERUBAHAN DI SINI: Ganti utcnow() menjadi now(timezone.utc) ---
+            (str(user_id), role, content, datetime.now(timezone.utc).isoformat())
         )
         conn.commit()
 

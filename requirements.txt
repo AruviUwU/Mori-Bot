@@ -1,4 +1,4 @@
 discord.py>=2.3.2
 google-genai>=2.12.1
 python-dotenv>=1.0.0
-duckduckgo-search>=8.1.1
+ddgs>=9.14.4

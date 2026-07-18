@@ -11,7 +11,7 @@ import discord
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 import database
 
